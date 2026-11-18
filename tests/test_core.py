@@ -33,9 +33,58 @@ def test_dataset_files_exist():
 
 
 # Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).
-@pytest.mark.skip(reason="remove this line when you start milestone 2")
-def test_milestone_2():
-    raise NotImplementedError("write the test for milestone 2")
+@pytest.fixture
+def tiny():
+    torch.manual_seed(0)
+    return core.load_base(TINY)
+
+
+def test_lora_starts_as_identity_and_freezes_the_base(tiny):
+    model, tok = tiny
+    x = tok("Event: minute 3 | goal", return_tensors="pt")
+    before = model(**x).logits
+    replaced = core.inject_lora(model, ("c_attn",), r=4)
+    assert len(replaced) == model.config.n_layer
+    assert torch.allclose(model(**x).logits, before)  # B = 0 -> no change yet
+    trainable, total = core.count_params(model)
+    names = [n for n, p in model.named_parameters() if p.requires_grad]
+    assert names and all(n.endswith((".A", ".B")) for n in names) and trainable < total
+
+
+def test_prompt_is_masked_in_the_labels(tiny):
+    _, tok = tiny
+    pair = core.make_pairs(1, seed=0)[0]
+    ids, labels = core.encode_pair(tok, pair)
+    n_prompt = len(tok(core.prompt_for(pair["input"]))["input_ids"])
+    assert labels[:n_prompt] == [-100] * n_prompt and labels[n_prompt:] == ids[n_prompt:]
+
+
+PAIRS = core.make_pairs(40, seed=0)
+
+
+@pytest.fixture(scope="module")
+def trained():
+    torch.manual_seed(0)
+    model, tok = core.load_base(TINY)
+    core.inject_lora(model, ("c_attn", "c_proj"), r=4, alpha=8)
+    before = core.mean_loss(model, tok, PAIRS)
+    history = core.train_lora(model, tok, PAIRS, epochs=3, lr=5e-2, batch_size=8, log=lambda *_: None)
+    return model, tok, {"history": history, "before": before, "after": core.mean_loss(model, tok, PAIRS)}
+
+
+def test_training_moves_only_the_adapter_and_lowers_loss(trained):
+    model, _, stats = trained
+    assert stats["history"] and stats["after"] < stats["before"]
+    assert any(m.B.abs().sum() > 0 for m in model.modules() if isinstance(m, core.LoRALinear))
+
+
+def test_adapter_save_and_load(trained, tmp_path):
+    model, tok, _ = trained
+    path = tmp_path / "a.pt"
+    core.save_adapter(model, path, {"base": TINY, "r": 4, "alpha": 8, "targets": ["c_attn", "c_proj"]})
+    loaded, _, meta = core.load_adapted(path=path)
+    x = tok("Event: minute 10 | save", return_tensors="pt")
+    assert meta["r"] == 4 and torch.allclose(model(**x).logits, loaded(**x).logits, atol=1e-5)
 
 
 # Milestone 3: Build a Streamlit interface to input event descriptions and generate commentary.

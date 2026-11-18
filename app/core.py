@@ -121,9 +121,168 @@ def build_dataset(n_train: int = 600, n_test: int = 60) -> tuple[list[dict], lis
 
 
 # --- Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).
-# Hint: LoRA adapter injection and training
-def milestone_2():  # TODO(milestone 2)
-    raise NotImplementedError("TODO(milestone 2)")
+
+class LoRALinear(nn.Module):
+    """Wraps a frozen GPT-2 Conv1D/Linear layer:  y = base(x) + (x @ A @ B) * alpha / r.
+
+    A starts small and random, B starts at zero, so at step 0 the adapted model equals GPT-2 exactly.
+    Only A and B (r * (d_in + d_out) numbers) are trained.
+    """
+
+    def __init__(self, base: nn.Module, r: int = 8, alpha: float = 16.0, dropout: float = 0.05):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad = False
+        w = base.weight
+        # GPT-2's Conv1D stores weight as (in, out); nn.Linear stores (out, in)
+        self.conv1d = type(base).__name__ == "Conv1D"
+        d_in, d_out = (w.shape[0], w.shape[1]) if self.conv1d else (w.shape[1], w.shape[0])
+        self.r, self.scale = r, alpha / r
+        self.A = nn.Parameter(torch.randn(d_in, r) / math.sqrt(d_in))
+        self.B = nn.Parameter(torch.zeros(r, d_out))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + (self.drop(x) @ self.A @ self.B) * self.scale
+
+    def delta_weight(self) -> torch.Tensor:
+        """The full-size weight change the adapter represents, in the base layer's layout."""
+        d = (self.A @ self.B) * self.scale  # (in, out)
+        return d if self.conv1d else d.T
+
+    def merged(self) -> nn.Module:
+        """The base layer with the adapter folded into its weight (no extra matmuls at inference)."""
+        with torch.no_grad():
+            self.base.weight += self.delta_weight()
+        return self.base
+
+
+def inject_lora(model: nn.Module, targets=("c_attn",), r: int = 8, alpha: float = 16.0) -> list[str]:
+    """Freeze the whole model, then replace every sub-module whose name ends in a target with LoRALinear."""
+    for p in model.parameters():
+        p.requires_grad = False
+    replaced = []
+    for name, module in list(model.named_modules()):
+        for child_name, child in list(module.named_children()):
+            if child_name in targets:
+                setattr(module, child_name, LoRALinear(child, r, alpha))
+                replaced.append(f"{name}.{child_name}")
+    return replaced
+
+
+def count_params(model: nn.Module) -> tuple[int, int]:
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return trainable, sum(p.numel() for p in model.parameters())
+
+
+def load_base(name: str = "gpt2"):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(name)
+    tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(name)
+    return model, tok
+
+
+def prompt_for(event_text: str) -> str:
+    return f"Event: {event_text}\nCommentary:"
+
+
+def encode_pair(tok, pair: dict, max_len: int = 96) -> tuple[list[int], list[int]]:
+    """Token ids and labels; the event prompt is masked (-100) so only the commentary is learned."""
+    p = tok(prompt_for(pair["input"]))["input_ids"]
+    c = tok(" " + pair["commentary"])["input_ids"] + [tok.eos_token_id]
+    ids = (p + c)[:max_len]
+    return ids, ([-100] * len(p) + c)[:max_len]
+
+
+def train_lora(model, tok, pairs: list[dict], epochs: int = 2, lr: float = 2e-3, batch_size: int = 8,
+               seed: int = 0, log=print) -> list[dict]:
+    """Plain PyTorch loop: AdamW on the adapter parameters only."""
+    torch.manual_seed(seed)
+    rng = random.Random(seed)
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError("no trainable parameters: call inject_lora first")
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+    data = [encode_pair(tok, p) for p in pairs]
+    steps = epochs * math.ceil(len(data) / batch_size)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: max(0.05, 1 - s / steps))
+    model.train()
+    history, step, start = [], 0, time.time()
+    for epoch in range(epochs):
+        rng.shuffle(data)
+        for i in range(0, len(data), batch_size):
+            batch = data[i:i + batch_size]
+            width = max(len(x) for x, _ in batch)
+            ids = torch.tensor([x + [tok.eos_token_id] * (width - len(x)) for x, _ in batch])
+            labels = torch.tensor([y + [-100] * (width - len(y)) for _, y in batch])
+            mask = torch.tensor([[1] * len(x) + [0] * (width - len(x)) for x, _ in batch])
+            loss = model(input_ids=ids, attention_mask=mask, labels=labels).loss
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            sched.step()
+            step += 1
+            if step % 10 == 0 or step == steps:
+                history.append({"step": step, "epoch": epoch + 1, "loss": round(loss.item(), 4),
+                                "seconds": round(time.time() - start, 1)})
+                log(f"step {step}/{steps}  loss {loss.item():.3f}")
+    model.eval()
+    return history
+
+
+@torch.no_grad()
+def mean_loss(model, tok, pairs: list[dict]) -> float:
+    """Average cross-entropy on the commentary tokens (lower = the model expects these lines more)."""
+    model.eval()
+    losses = []
+    for pair in pairs:
+        ids, labels = encode_pair(tok, pair)
+        losses.append(model(input_ids=torch.tensor([ids]), labels=torch.tensor([labels])).loss.item())
+    return sum(losses) / len(losses)
+
+
+def lora_state(model: nn.Module) -> dict:
+    """Only the adapter weights: a few hundred KB instead of GPT-2's 500 MB."""
+    return {k: v for k, v in model.state_dict().items() if k.endswith(".A") or k.endswith(".B")}
+
+
+def save_adapter(model, path: Path = ADAPTER_FILE, meta: dict | None = None) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state": lora_state(model), "meta": meta or {}}, path)
+
+
+def load_adapted(base_name: str = "gpt2", path: Path = ADAPTER_FILE):
+    """GPT-2 + saved adapter, ready to generate."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    meta = ckpt["meta"]
+    model, tok = load_base(meta.get("base", base_name))
+    inject_lora(model, tuple(meta.get("targets", ["c_attn"])), meta.get("r", 8), meta.get("alpha", 16.0))
+    missing = model.load_state_dict(ckpt["state"], strict=False)
+    assert not [k for k in missing.missing_keys if k.endswith((".A", ".B"))]
+    model.eval()
+    return model, tok, meta
+
+
+@torch.no_grad()
+def generate(model, tok, event: dict | str, n: int = 1, temperature: float = 0.8, top_p: float = 0.9,
+             max_new_tokens: int = 40, seed: int | None = None) -> list[str]:
+    """n commentary options for one event (sampling), or the single most likely line with n=1, temperature=0."""
+    text = event if isinstance(event, str) else describe(event)
+    ids = tok(prompt_for(text), return_tensors="pt")
+    if seed is not None:
+        torch.manual_seed(seed)
+    out = model.generate(**ids, do_sample=temperature > 0, temperature=temperature or None,
+                         top_p=top_p if temperature > 0 else None, max_new_tokens=max_new_tokens,
+                         num_return_sequences=n, pad_token_id=tok.eos_token_id)
+    lines = []
+    for seq in out:
+        new = tok.decode(seq[ids["input_ids"].shape[1]:], skip_special_tokens=True)
+        lines.append(new.strip().split("\n")[0].strip())
+    return lines
 
 
 # --- Milestone 3: Build a Streamlit interface to input event descriptions and generate commentary.

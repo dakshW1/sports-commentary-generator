@@ -300,9 +300,52 @@ def load_snippets(path: Path = SAVED_FILE) -> list[dict]:
 
 
 # --- Milestone 4: Test the model's ability to produce relevant and engaging commentary.
-# Hint: Model evaluation
-def milestone_4():  # TODO(milestone 4)
-    raise NotImplementedError("TODO(milestone 4)")
+
+EVENT_WORDS = {
+    "goal": ["goal", "score", "net", "finish", "in!", "strike"],
+    "penalty_goal": ["penalty", "spot"],
+    "penalty_miss": ["penalty", "miss", "saved", "post"],
+    "save": ["save", "stop", "denies", "fingertips", "stretch"],
+    "yellow_card": ["yellow", "book"],
+    "red_card": ["red", "sent off", "ten"],
+    "substitution": ["change", "comes on", "substitution", "fresh legs", "is on", "enters"],
+    "equaliser": ["equalis", "level", "all square", "back in it"],
+    "half_time": ["half time", "break", "first half"],
+    "full_time": ["full time", "over", "final whistle"],
+}
+
+
+def relevance(event: dict, line: str) -> dict:
+    """Which facts from the event made it into the line."""
+    low = line.lower()
+    return {"player": event["player"].lower() in low,
+            "team": event["team"].lower() in low,
+            "event": any(w in low for w in EVENT_WORDS[event["type"]]),
+            "no_wrong_score": all(s == event["score"] for s in _scores(line))}
+
+
+def _scores(line: str) -> list[str]:
+    import re
+    return re.findall(r"\b\d-\d\b", line)
+
+
+def distinct_n(lines: list[str], n: int = 2) -> float:
+    """Share of unique n-grams across lines: higher = more varied (more engaging) commentary."""
+    grams = [tuple(t[i:i + n]) for t in (l.lower().split() for l in lines) for i in range(len(t) - n + 1)]
+    return len(set(grams)) / len(grams) if grams else 0.0
+
+
+def evaluate(model, tok, pairs: list[dict], seed: int = 0, samples_per_event: int = 1) -> dict:
+    """Relevance (fact recall) and variety on held-out events with unseen teams and players."""
+    lines, checks = [], []
+    for i, p in enumerate(pairs):
+        for line in generate(model, tok, p["event"], n=samples_per_event, seed=seed + i):
+            lines.append(line)
+            checks.append(relevance(p["event"], line))
+    rate = {k: round(sum(c[k] for c in checks) / len(checks), 3) for k in checks[0]}
+    rate["all_facts"] = round(sum(all(c.values()) for c in checks) / len(checks), 3)
+    return {"n": len(lines), **rate, "distinct_2": round(distinct_n(lines), 3),
+            "avg_words": round(sum(len(l.split()) for l in lines) / len(lines), 1), "examples": lines[:5]}
 
 
 # --- Milestone 5: Implement adapter merging for inference.

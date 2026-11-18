@@ -104,9 +104,24 @@ def test_generate_returns_n_options(trained):
 
 
 # Milestone 4: Test the model's ability to produce relevant and engaging commentary.
-@pytest.mark.skip(reason="remove this line when you start milestone 4")
-def test_milestone_4():
-    raise NotImplementedError("write the test for milestone 4")
+def test_relevance_checks_facts():
+    for p in core.make_pairs(50, seed=0):  # every training template passes the event-word check
+        assert core.relevance(p["event"], p["commentary"])["event"]
+    ev = {"type": "red_card", "minute": 70, "team": "Cedar Park", "player": "Moreau", "score": "1-0"}
+    assert all(core.relevance(ev, "RED CARD! Moreau is sent off, Cedar Park still lead 1-0").values())
+    bad = core.relevance(ev, "Silva scores! 2-2")
+    assert not bad["player"] and not bad["event"] and not bad["no_wrong_score"]
+
+
+def test_distinct_n_measures_variety():
+    assert core.distinct_n(["a b c", "a b c"]) == 0.5
+    assert core.distinct_n(["a b c", "d e f"]) == 1.0
+
+
+def test_evaluate_reports_rates(trained):
+    model, tok, _ = trained
+    res = core.evaluate(model, tok, core.make_pairs(4, seed=5))
+    assert res["n"] == 4 and 0 <= res["all_facts"] <= 1 and 0 <= res["distinct_2"] <= 1
 
 
 # Milestone 5: Implement adapter merging for inference.

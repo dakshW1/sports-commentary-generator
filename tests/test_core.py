@@ -125,7 +125,26 @@ def test_evaluate_reports_rates(trained):
 
 
 # Milestone 5: Implement adapter merging for inference.
-@pytest.mark.skip(reason="remove this line when you start milestone 5")
-def test_milestone_5():
-    raise NotImplementedError("write the test for milestone 5")
+def test_merging_gives_the_same_outputs_without_lora_layers(trained, tmp_path):
+    model, tok, _ = trained
+    path = tmp_path / "a.pt"
+    core.save_adapter(model, path, {"base": TINY, "r": 4, "alpha": 8, "targets": ["c_attn", "c_proj"]})
+    reference, _, _ = core.load_adapted(path=path)
+    merged, _, _ = core.load_adapted(path=path)
+    n = core.merge_lora(merged)
+    assert n == 3 * merged.config.n_layer  # c_attn + attention c_proj + MLP c_proj
+    assert not any(isinstance(m, core.LoRALinear) for m in merged.modules())
+    assert core.max_logit_difference(merged, reference, tok, "Event: minute 5 | goal") < 1e-4
+    core.save_merged(merged, tok, tmp_path / "merged")
+    again, _ = core.load_merged(tmp_path / "merged")
+    assert core.max_logit_difference(again, reference, tok, "Event: minute 5 | goal") < 1e-4
 
+
+from app.cli import main  # noqa: E402
+
+
+def test_cli_dataset_and_help(capsys, monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "TRAIN_FILE", tmp_path / "train.jsonl")
+    monkeypatch.setattr(core, "TEST_FILE", tmp_path / "test.jsonl")
+    main(["dataset", "--train", "20", "--test", "5"])
+    assert "20 training pairs, 5 test pairs" in capsys.readouterr().out

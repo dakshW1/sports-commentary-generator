@@ -349,6 +349,44 @@ def evaluate(model, tok, pairs: list[dict], seed: int = 0, samples_per_event: in
 
 
 # --- Milestone 5: Implement adapter merging for inference.
-# Hint: Adapter merging
-def milestone_5():  # TODO(milestone 5)
-    raise NotImplementedError("TODO(milestone 5)")
+
+def merge_lora(model: nn.Module) -> int:
+    """Replace every LoRALinear with its base layer, adapter folded in. Returns how many were merged."""
+    count = 0
+    for _, module in list(model.named_modules()):
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, LoRALinear):
+                setattr(module, child_name, child.merged())
+                count += 1
+    return count
+
+
+@torch.no_grad()
+def max_logit_difference(a: nn.Module, b: nn.Module, tok, text: str) -> float:
+    ids = tok(text, return_tensors="pt")
+    return (a(**ids).logits - b(**ids).logits).abs().max().item()
+
+
+@torch.no_grad()
+def time_forward(model: nn.Module, tok, text: str, reps: int = 20) -> float:
+    ids = tok(text, return_tensors="pt")
+    model(**ids)  # warm-up
+    start = time.perf_counter()
+    for _ in range(reps):
+        model(**ids)
+    return (time.perf_counter() - start) / reps * 1000  # ms per forward pass
+
+
+def save_merged(model, tok, out_dir: Path = MERGED_DIR) -> None:
+    model.save_pretrained(out_dir)
+    tok.save_pretrained(out_dir)
+
+
+def load_merged(out_dir: Path = MERGED_DIR):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(out_dir)
+    tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(out_dir)
+    model.eval()
+    return model, tok

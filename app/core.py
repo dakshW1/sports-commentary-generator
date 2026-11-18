@@ -1,9 +1,123 @@
-"""Your code. One stub per milestone; build them in order and keep each one small."""
+"""Sports Commentary Generator: GPT-2 adapted with LoRA (written from scratch) to turn match events into
+commentary.
+
+  1. dataset    - simulated football events paired with commentary lines
+  2. LoRA       - low-rank adapters injected into GPT-2's attention, trained while GPT-2 stays frozen
+  3. UI         - Streamlit page in app/main.py
+  4. evaluation - does the commentary mention the right player/team/minute/event, and is it varied?
+  5. merging    - fold the adapters into GPT-2's weights for plain, faster inference
+"""
+from __future__ import annotations
+
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "dataset"
+TRAIN_FILE = DATA_DIR / "train.jsonl"
+TEST_FILE = DATA_DIR / "test.jsonl"
+ADAPTER_FILE = ROOT / "models" / "lora_adapter.pt"
+MERGED_DIR = ROOT / "models" / "merged"
+SAVED_FILE = ROOT / "saved_commentary.jsonl"
+
 
 # --- Milestone 1: Create a small dataset of simulated sports events and commentary pairs.
-# Hint: Dataset creation
-def milestone_1():  # TODO(milestone 1)
-    raise NotImplementedError("TODO(milestone 1)")
+
+EVENT_TYPES = ["goal", "penalty_goal", "penalty_miss", "save", "yellow_card", "red_card",
+               "substitution", "equaliser", "half_time", "full_time"]
+
+TEAMS = ["Riverside Rovers", "Northgate United", "Harbour City", "Eastwood Athletic", "Kingsbridge FC",
+         "Valley Wanderers", "Ironworks Town", "Lakeshore Rangers"]
+PLAYERS = ["Okafor", "Silva", "Mehta", "Kowalski", "Haddad", "Larsen", "Nakamura", "Diallo", "Reyes",
+           "Fischer", "O'Brien", "Petrov", "Mensah", "Costa", "Varga", "Iyer"]
+# unseen in training: used for the test split, so evaluation checks generalisation, not memory
+TEST_TEAMS = ["Moorfield Albion", "Cedar Park"]
+TEST_PLAYERS = ["Banerjee", "Lindqvist", "Adeyemi", "Moreau"]
+
+COMMENTARY = {
+    "goal": ["GOAL! {player} scores for {team} in the {minute}th minute! It's {score} now!",
+             "{player} finds the back of the net! {team} lead {score} after {minute} minutes.",
+             "What a finish from {player}! {team} make it {score} on {minute} minutes.",
+             "It's in! {player} strikes for {team}, and the score is {score}."],
+    "penalty_goal": ["{player} steps up... and scores the penalty! {team} {score}, {minute} minutes gone.",
+                     "Cool as you like from the spot, {player} converts for {team}. {score}.",
+                     "Penalty scored! {player} sends the keeper the wrong way. {team} make it {score}."],
+    "penalty_miss": ["{player} misses the penalty! {team} waste a golden chance on {minute} minutes.",
+                     "Saved! {player}'s penalty is kept out and {team} stay on {score}.",
+                     "Off the post! {player} can't believe it, the penalty stays out for {team}."],
+    "save": ["Brilliant save! {player} denies {team} in the {minute}th minute.",
+             "{player} at full stretch to keep it {score}! What a stop against {team}.",
+             "Fingertips! {player} pushes it wide and {team} are frustrated."],
+    "yellow_card": ["{player} goes into the book for {team} after a late challenge on {minute} minutes.",
+                    "Yellow card for {player}. {team} need to be careful now.",
+                    "The referee shows a yellow to {player} of {team}."],
+    "red_card": ["RED CARD! {player} is sent off and {team} are down to ten men on {minute} minutes!",
+                 "{player} sees red! {team} will have to defend {score} with ten.",
+                 "Straight red for {player}! A huge blow for {team}."],
+    "substitution": ["A change for {team}: {player} comes on in the {minute}th minute.",
+                     "{player} is on for {team}, fresh legs with the score at {score}.",
+                     "Substitution for {team} as {player} enters the game."],
+    "equaliser": ["{player} equalises for {team}! It's {score}, and we're level on {minute} minutes!",
+                  "All square! {player} levels it for {team}. {score}.",
+                  "{team} are back in it! {player} with the equaliser, {score}."],
+    "half_time": ["The referee blows for half time. {team} lead {score} at the break.",
+                  "Half time here, and it's {score}. {team} will be the happier side.",
+                  "That's the end of the first half with {team} on top at {score}."],
+    "full_time": ["Full time! {team} win it {score}!",
+                  "It's all over! {team} take the points with a {score} result.",
+                  "The final whistle goes, {team} {score}. What a match!"],
+}
+
+
+def describe(event: dict) -> str:
+    """The text the model reads: one structured line per event."""
+    return (f"minute {event['minute']} | {event['type'].replace('_', ' ')} | team {event['team']} | "
+            f"player {event['player']} | score {event['score']}")
+
+
+def random_event(rng: random.Random, teams=TEAMS, players=PLAYERS, etype: str | None = None) -> dict:
+    etype = etype or rng.choice(EVENT_TYPES)
+    minute = {"half_time": 45, "full_time": 90}.get(etype, rng.randint(1, 90))
+    a, b = rng.randint(0, 4), rng.randint(0, 3)
+    if etype == "equaliser":
+        b = a
+    return {"type": etype, "minute": minute, "team": rng.choice(teams), "player": rng.choice(players),
+            "score": f"{max(a, b)}-{min(a, b)}" if etype not in ("equaliser",) else f"{a}-{b}"}
+
+
+def make_pairs(n: int, seed: int, teams=TEAMS, players=PLAYERS) -> list[dict]:
+    """n (event, commentary) pairs, balanced over event types."""
+    rng = random.Random(seed)
+    pairs = []
+    for i in range(n):
+        ev = random_event(rng, teams, players, EVENT_TYPES[i % len(EVENT_TYPES)])
+        line = rng.choice(COMMENTARY[ev["type"]]).format(**ev)
+        pairs.append({"event": ev, "input": describe(ev), "commentary": line})
+    rng.shuffle(pairs)
+    return pairs
+
+
+def write_jsonl(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(x) for x in Path(path).read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def build_dataset(n_train: int = 600, n_test: int = 60) -> tuple[list[dict], list[dict]]:
+    train = make_pairs(n_train, seed=1)
+    test = make_pairs(n_test, seed=2, teams=TEST_TEAMS, players=TEST_PLAYERS)
+    write_jsonl(train, TRAIN_FILE)
+    write_jsonl(test, TEST_FILE)
+    return train, test
 
 
 # --- Milestone 2: Implement LoRA adapter injection and training on a pre-trained LLM (e.g., GPT-2).

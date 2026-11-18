@@ -1,7 +1,6 @@
-streamlit
 httpx
 pytest
 torch
 transformers
-datasets
 numpy
+streamlit

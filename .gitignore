@@ -10,3 +10,7 @@ __pycache__/
 # Local data
 data/
 *.db
+
+# merged model (about 480 MB): rebuild with `python -m app.cli merge`
+models/merged/
+saved_commentary.jsonl

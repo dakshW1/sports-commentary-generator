@@ -88,9 +88,19 @@ def test_adapter_save_and_load(trained, tmp_path):
 
 
 # Milestone 3: Build a Streamlit interface to input event descriptions and generate commentary.
-@pytest.mark.skip(reason="remove this line when you start milestone 3")
-def test_milestone_3():
-    raise NotImplementedError("write the test for milestone 3")
+def test_page_compiles_and_snippets_are_saved(tmp_path):
+    py_compile.compile("app/main.py", doraise=True)
+    ev = core.make_pairs(1, seed=3)[0]["event"]
+    core.save_snippet(ev, "What a goal!", tmp_path / "s.jsonl")
+    assert core.load_snippets(tmp_path / "s.jsonl")[0]["commentary"] == "What a goal!"
+    assert core.load_snippets(tmp_path / "missing.jsonl") == []
+
+
+def test_generate_returns_n_options(trained):
+    model, tok, _ = trained
+    lines = core.generate(model, tok, core.make_pairs(1, seed=4)[0]["event"], n=3, seed=0,
+                          max_new_tokens=10)
+    assert len(lines) == 3 and all(isinstance(line, str) for line in lines)
 
 
 # Milestone 4: Test the model's ability to produce relevant and engaging commentary.

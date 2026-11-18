@@ -286,9 +286,17 @@ def generate(model, tok, event: dict | str, n: int = 1, temperature: float = 0.8
 
 
 # --- Milestone 3: Build a Streamlit interface to input event descriptions and generate commentary.
-# Hint: Streamlit UI development
-def milestone_3():  # TODO(milestone 3)
-    raise NotImplementedError("TODO(milestone 3)")
+# The page is app/main.py. These helpers keep it thin (and testable without a browser).
+
+def save_snippet(event: dict, line: str, path: Path = SAVED_FILE) -> dict:
+    record = {"event": event, "commentary": line, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    return record
+
+
+def load_snippets(path: Path = SAVED_FILE) -> list[dict]:
+    return read_jsonl(path) if Path(path).exists() else []
 
 
 # --- Milestone 4: Test the model's ability to produce relevant and engaging commentary.
